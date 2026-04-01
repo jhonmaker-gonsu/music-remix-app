@@ -5,6 +5,7 @@ remix_gui.py — ステム別エフェクト調整GUI
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -16,10 +17,13 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from pedalboard import (
+    Bitcrush,
+    Clipping,
     Compressor,
     Delay,
     Distortion,
     Gain,
+    LadderFilter,
     Limiter,
     LowpassFilter,
     Pedalboard,
@@ -32,8 +36,10 @@ try:
         QApplication,
         QButtonGroup,
         QCheckBox,
+        QComboBox,
         QDoubleSpinBox,
         QFileDialog,
+        QInputDialog,
         QFrame,
         QGroupBox,
         QHBoxLayout,
@@ -173,6 +179,9 @@ class StemControl(QGroupBox):
         base = [
             ("Volume", "volume", 0.0, 4.0, 1.0, 0.1),
             ("Distortion", "dist_db", 0.0, 30.0, 0.0, 1.0),
+            ("Bitcrush bit", "bitcrush", 0, 32, 0, 1),        # ローファイ: bit数を下げてデジタル劣化
+            ("Clipping dB", "clipping_db", -30, 0, 0, 1),     # ハードクリップ: 指定dBで波形を切る
+            ("Ladder Hz", "ladder_hz", 0, 20000, 0, 100),      # アナログシンセ風フィルター: 0=OFF
             ("Lowpass Hz", "lowpass_hz", 200, 20000, 20000, 100),
             ("Delay ms", "delay_ms", 0, 500, 100, 10),
             ("Delay FB %", "delay_fb", 0, 80, 10, 1),
@@ -210,12 +219,16 @@ class RemixGUI(QMainWindow):
         self.stems_raw: dict[str, np.ndarray] = {}
         self.sr = 44100
         self.playing = False
+        self._cancel = False  # 処理中断フラグ
         self.track_name = ""  # 読み込んだ曲名
         self.export_format = "wav"
         self.action_buttons: list[QPushButton] = []
         self._active_tasks: list[tuple[threading.Thread, TaskSignals]] = []
+        self.presets_dir = Path(__file__).parent / "presets"
+        self.presets_dir.mkdir(exist_ok=True)
 
         self._build_ui()
+        self._refresh_preset_combo()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -262,6 +275,17 @@ class RemixGUI(QMainWindow):
         action_row.addWidget(self._build_format_box())
         action_row.addWidget(self.export_button)
         action_row.addStretch(1)
+
+        # プリセットプルダウン + 保存/削除
+        action_row.addWidget(QLabel("プリセット:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(180)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        action_row.addWidget(self.preset_combo)
+        self.save_preset_button = self._make_button("保存", self._save_preset, min_width=70)
+        self.delete_preset_button = self._make_button("削除", self._delete_preset, min_width=70)
+        action_row.addWidget(self.save_preset_button)
+        action_row.addWidget(self.delete_preset_button)
         action_row.addWidget(self.preset_button)
         action_row.addWidget(self.reset_button)
         root.addLayout(action_row)
@@ -556,6 +580,10 @@ class RemixGUI(QMainWindow):
         sr = self.sr
         processed = {}
         for name in self.STEM_NAMES:
+            if self._cancel:
+                if status_callback is not None:
+                    status_callback("中断されました")
+                return None
             if name in mute_stems:
                 # ミュートされたステムはゼロ信号
                 ref = self.stems_raw[name]
@@ -582,6 +610,19 @@ class RemixGUI(QMainWindow):
             effects = []
             if params["dist_db"] > 0.1:
                 effects.append(Distortion(drive_db=params["dist_db"]))
+            # Bitcrush: bit数を下げてローファイ化 (32=OFF, 低いほど劣化)
+            if 0 < params.get("bitcrush", 0) < 32:
+                effects.append(Bitcrush(bit_depth=params["bitcrush"]))
+            # Clipping: 指定dBで波形をハードクリップ (0=OFF, 負の値で強い歪み)
+            if params.get("clipping_db", 0) < -0.1:
+                effects.append(Clipping(threshold_db=params["clipping_db"]))
+            # LadderFilter: アナログシンセ風レゾナンスフィルター (0=OFF)
+            if params.get("ladder_hz", 0) > 100:
+                effects.append(LadderFilter(
+                    mode=LadderFilter.Mode.LPF24,
+                    cutoff_hz=params["ladder_hz"],
+                    resonance=0.5,
+                ))
             if params["lowpass_hz"] < 19000:
                 effects.append(LowpassFilter(cutoff_frequency_hz=params["lowpass_hz"]))
             if params["delay_mix"] > 0.1:
@@ -655,6 +696,7 @@ class RemixGUI(QMainWindow):
 
         sd.stop()
         self.playing = True
+        self._cancel = False
         offset = self.preview_offset.value()
         muted = self._get_muted_stems()
         self._set_status(f"プレビュー処理中... ({offset}秒から)")
@@ -671,12 +713,25 @@ class RemixGUI(QMainWindow):
                 status_callback=signals.status.emit,
                 mute_stems=muted,
             )
-            if audio is None:
+            if audio is None or self._cancel:
                 return
             signals.status.emit("再生中...")
-            sd.play(audio.astype(np.float32), self.sr)
-            sd.wait()
-            if self.playing:
+            audio32 = audio.astype(np.float32)
+            for attempt in range(3):
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                    sd.play(audio32, self.sr)
+                    sd.wait()
+                    break
+                except sd.PortAudioError:
+                    if attempt < 2:
+                        import time
+                        time.sleep(0.5)
+                        signals.status.emit("オーディオデバイス再接続中...")
+                    else:
+                        signals.status.emit("エラー: オーディオデバイスに接続できません")
+            if self.playing and not self._cancel:
                 signals.status.emit("再生完了")
 
         def on_finished() -> None:
@@ -686,7 +741,8 @@ class RemixGUI(QMainWindow):
         self._run_task(task, on_finished=on_finished)
 
     def _stop_preview(self) -> None:
-        sd.stop()
+        self._cancel = True   # 処理中でも中断
+        sd.stop()             # 再生中なら停止
         self.playing = False
         self.stop_button.setEnabled(False)
         self._set_status("停止")
@@ -695,6 +751,7 @@ class RemixGUI(QMainWindow):
         if not self.stems_raw:
             QMessageBox.warning(self, "警告", "先にステムを読み込んでください")
             return
+        self._cancel = False
 
         fmt = self.export_format
         default_name = f"{self.track_name}_remix.{fmt}" if self.track_name else f"remix_output.{fmt}"
@@ -761,6 +818,7 @@ class RemixGUI(QMainWindow):
         if not self.stems_raw:
             QMessageBox.warning(self, "警告", "先にステムを読み込んでください")
             return
+        self._cancel = False
 
         fmt = self.export_format
         default_name = f"{self.track_name}_novocal.{fmt}" if self.track_name else f"remix_novocal.{fmt}"
@@ -818,6 +876,101 @@ class RemixGUI(QMainWindow):
             QMessageBox.information(self, "完了", f"ボーカルなし書き出し完了:\n{path}")
 
         self._run_task(task, on_result=on_result, on_finished=lambda: self._set_action_buttons_enabled(True))
+
+    def _refresh_preset_combo(self) -> None:
+        """presetsフォルダをスキャンしてプルダウンを更新"""
+        self.preset_combo.blockSignals(True)
+        current = self.preset_combo.currentText()
+        self.preset_combo.clear()
+        self.preset_combo.addItem("-- 選択 --")
+        for f in sorted(self.presets_dir.glob("*.json")):
+            self.preset_combo.addItem(f.stem)
+        # 元の選択を復元
+        idx = self.preset_combo.findText(current)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
+
+    def _on_preset_selected(self, index: int) -> None:
+        """プルダウンでプリセットを選択した時"""
+        name = self.preset_combo.currentText()
+        if name == "-- 選択 --" or not name:
+            return
+        filepath = self.presets_dir / f"{name}.json"
+        if not filepath.exists():
+            return
+        self._apply_preset_file(filepath)
+
+    def _save_preset(self) -> None:
+        """現在のスライダー設定に名前をつけてJSON保存"""
+        name, ok = QInputDialog.getText(self, "プリセット保存", "プリセット名:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        preset = {
+            "name": name,
+            "stems": {},
+            "master": {k: ctrl.value() for k, ctrl in self.master_sliders.items()},
+            "mute": {n: cb.isChecked() for n, cb in self.mute_checks.items()},
+            "preview_offset": self.preview_offset.value(),
+            "export_format": self.export_format,
+        }
+        for sname in self.STEM_NAMES:
+            preset["stems"][sname] = self.stem_controls[sname].get_params()
+
+        outpath = self.presets_dir / f"{name}.json"
+        with open(outpath, "w", encoding="utf-8") as f:
+            json.dump(preset, f, indent=2, ensure_ascii=False)
+
+        self._refresh_preset_combo()
+        idx = self.preset_combo.findText(name)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self._set_status(f"プリセット保存完了: {name}")
+
+    def _delete_preset(self) -> None:
+        """選択中のプリセットを削除"""
+        name = self.preset_combo.currentText()
+        if name == "-- 選択 --" or not name:
+            return
+        filepath = self.presets_dir / f"{name}.json"
+        if not filepath.exists():
+            return
+        reply = QMessageBox.question(
+            self, "確認", f"プリセット「{name}」を削除しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        filepath.unlink()
+        self._refresh_preset_combo()
+        self._set_status(f"プリセット削除: {name}")
+
+    def _apply_preset_file(self, filepath: Path) -> None:
+        """JSONプリセットファイルを適用"""
+        with open(filepath, "r", encoding="utf-8") as f:
+            preset = json.load(f)
+
+        for name, params in preset.get("stems", {}).items():
+            if name in self.stem_controls:
+                self.stem_controls[name].set_params(params)
+
+        for key, value in preset.get("master", {}).items():
+            if key in self.master_sliders:
+                self.master_sliders[key].set_value(value)
+
+        for name, checked in preset.get("mute", {}).items():
+            if name in self.mute_checks:
+                self.mute_checks[name].setChecked(checked)
+
+        if "preview_offset" in preset:
+            self.preview_offset.setValue(preset["preview_offset"])
+
+        if "export_format" in preset:
+            self.export_format = preset["export_format"]
+
+        preset_name = preset.get("name", filepath.stem)
+        self._set_status(f"プリセット適用: {preset_name}")
 
     def _load_v2_preset(self) -> None:
         presets = {
