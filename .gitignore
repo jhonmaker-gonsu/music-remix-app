@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+remix_*/
+*.wav
+*.mp3
+*.flac
+.DS_Store

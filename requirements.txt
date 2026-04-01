@@ -1,0 +1,9 @@
+PySide6
+pedalboard>=0.9
+soundfile
+sounddevice
+librosa>=0.10
+demucs>=4.0
+pyworld
+numpy
+scipy
