@@ -1,0 +1,91 @@
+{
+  "name": "2",
+  "stems": {
+    "drums": {
+      "volume": 0.5,
+      "dist_db": 10.0,
+      "bitcrush": 32.0,
+      "clipping_db": 0.0,
+      "ladder_hz": 0.0,
+      "lowpass_hz": 20000.0,
+      "delay_ms": 10.0,
+      "delay_fb": 44.0,
+      "delay_mix": 44.0,
+      "reverb_room": 0.0,
+      "reverb_wet": 0.0,
+      "comp_thresh": -18.0,
+      "comp_ratio": 4.0,
+      "comp_attack": 5.1,
+      "comp_release": 50.0,
+      "gain_db": 0.0
+    },
+    "bass": {
+      "volume": 0.5,
+      "dist_db": 30.0,
+      "bitcrush": 32.0,
+      "clipping_db": 0.0,
+      "ladder_hz": 0.0,
+      "lowpass_hz": 20000.0,
+      "delay_ms": 20.0,
+      "delay_fb": 58.0,
+      "delay_mix": 58.0,
+      "reverb_room": 0.0,
+      "reverb_wet": 0.0,
+      "comp_thresh": -18.0,
+      "comp_ratio": 4.0,
+      "comp_attack": 5.1,
+      "comp_release": 50.0,
+      "gain_db": 0.0
+    },
+    "vocals": {
+      "volume": 2.0,
+      "formant": -5.0,
+      "dist_db": 4.0,
+      "bitcrush": 11.0,
+      "clipping_db": 0.0,
+      "ladder_hz": 0.0,
+      "lowpass_hz": 20000.0,
+      "delay_ms": 30.0,
+      "delay_fb": 56.0,
+      "delay_mix": 56.0,
+      "reverb_room": 0.4,
+      "reverb_wet": 19.0,
+      "comp_thresh": -18.0,
+      "comp_ratio": 4.0,
+      "comp_attack": 5.1,
+      "comp_release": 50.0,
+      "gain_db": 0.0
+    },
+    "other": {
+      "volume": 1.0,
+      "dist_db": 23.0,
+      "bitcrush": 24.0,
+      "clipping_db": 0.0,
+      "ladder_hz": 0.0,
+      "lowpass_hz": 20000.0,
+      "delay_ms": 30.0,
+      "delay_fb": 57.0,
+      "delay_mix": 56.0,
+      "reverb_room": 0.0,
+      "reverb_wet": 0.0,
+      "comp_thresh": -18.0,
+      "comp_ratio": 4.0,
+      "comp_attack": 5.1,
+      "comp_release": 50.0,
+      "gain_db": 0.0
+    }
+  },
+  "master": {
+    "m_reverb_room": 0.4,
+    "m_reverb_wet": 25.0,
+    "m_limiter_db": -0.1
+  },
+  "mute": {
+    "drums": false,
+    "bass": false,
+    "vocals": false,
+    "other": false
+  },
+  "preview_offset": 55,
+  "export_format": "wav"
+}

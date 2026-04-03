@@ -6,3 +6,5 @@ remix_*/
 *.mp3
 *.flac
 .DS_Store
+.venv-ddsp/
+ddsp_models/

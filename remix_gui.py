@@ -13,6 +13,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+import librosa
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -68,11 +69,13 @@ try:
     import music_remix
 
     importlib.reload(music_remix)
-    from music_remix import shift_formant
+    from music_remix import instrumentize_vocal, shift_formant
 
     HAS_FORMANT = True
+    HAS_INSTRUMENTIZE = True
 except Exception:
     HAS_FORMANT = False
+    HAS_INSTRUMENTIZE = False
 
 
 class TaskSignals(QObject):
@@ -196,6 +199,13 @@ class StemControl(QGroupBox):
         ]
         if self.name == "vocals":
             base.insert(1, ("Formant 半音", "formant", -12.0, 12.0, 0.0, 0.5))
+            base.insert(2, ("楽器化 %", "instrumentize", 0, 100, 0, 1))
+            base.insert(3, ("子音抑制 %", "breath_reduce", 0, 100, 75, 1))
+            base.insert(4, ("暗さ %", "tone_darken", 0, 100, 35, 1))
+            base.insert(5, ("子音ゲート %", "consonant_suppress", 0, 100, 65, 1))
+            base.insert(6, ("高域ぼかし %", "modulation_blur", 0, 100, 45, 1))
+            base.insert(7, ("激歪み %", "grit_drive", 0, 100, 0, 1))
+            base.insert(8, ("ロボ変調 %", "robot_mod", 0, 100, 0, 1))
         return base
 
     def get_params(self) -> dict[str, float]:
@@ -226,6 +236,8 @@ class RemixGUI(QMainWindow):
         self._active_tasks: list[tuple[threading.Thread, TaskSignals]] = []
         self.presets_dir = Path(__file__).parent / "presets"
         self.presets_dir.mkdir(exist_ok=True)
+        self.ddsp_venv_dir = Path(__file__).parent / ".venv-ddsp"
+        self.ddsp_models_dir = Path(__file__).parent / "ddsp_models"
 
         self._build_ui()
         self._refresh_preset_combo()
@@ -267,13 +279,18 @@ class RemixGUI(QMainWindow):
         self.stop_button = self._make_button("停止", self._stop_preview, min_width=90)
         self.stop_button.setEnabled(False)
         self.export_button = self._make_button("書き出し", self._export, min_width=130, bold=True)
+        self.ddsp_button = self._make_button("DDSP VST 楽器化", self._run_ddsp_flute, min_width=170, bold=True)
         self.preset_button = self._make_button("V2 プリセット", self._load_v2_preset, min_width=130)
+        self.instrument_preset_button = self._make_button(
+            "歌メロ楽器化", self._load_instrument_preset, min_width=130
+        )
         self.reset_button = self._make_button("リセット", self._reset_all, min_width=110)
 
         action_row.addWidget(self.preview_button)
         action_row.addWidget(self.stop_button)
         action_row.addWidget(self._build_format_box())
         action_row.addWidget(self.export_button)
+        action_row.addWidget(self.ddsp_button)
         action_row.addStretch(1)
 
         # プリセットプルダウン + 保存/削除
@@ -287,6 +304,7 @@ class RemixGUI(QMainWindow):
         action_row.addWidget(self.save_preset_button)
         action_row.addWidget(self.delete_preset_button)
         action_row.addWidget(self.preset_button)
+        action_row.addWidget(self.instrument_preset_button)
         action_row.addWidget(self.reset_button)
         root.addLayout(action_row)
 
@@ -607,6 +625,21 @@ class RemixGUI(QMainWindow):
                     status_callback(f"フォルマント処理中... ({name})")
                 audio = shift_formant(audio, sr, params["formant"])
 
+            if name == "vocals" and HAS_INSTRUMENTIZE and params.get("instrumentize", 0) > 0.1:
+                if status_callback is not None:
+                    status_callback(f"歌メロ楽器化処理中... ({name})")
+                audio = instrumentize_vocal(
+                    audio,
+                    sr,
+                    amount=params["instrumentize"] / 100.0,
+                    breath_reduction=params.get("breath_reduce", 75) / 100.0,
+                    tone_darken=params.get("tone_darken", 35) / 100.0,
+                    consonant_suppress=params.get("consonant_suppress", 65) / 100.0,
+                    modulation_blur=params.get("modulation_blur", 45) / 100.0,
+                    grit_drive=params.get("grit_drive", 0) / 100.0,
+                    robot_mod=params.get("robot_mod", 0) / 100.0,
+                )
+
             effects = []
             if params["dist_db"] > 0.1:
                 effects.append(Distortion(drive_db=params["dist_db"]))
@@ -877,6 +910,152 @@ class RemixGUI(QMainWindow):
 
         self._run_task(task, on_result=on_result, on_finished=lambda: self._set_action_buttons_enabled(True))
 
+    def _run_ddsp_flute(self) -> None:
+        if not self.stems_raw or "vocals" not in self.stems_raw:
+            QMessageBox.warning(self, "警告", "先にステムを読み込んでください")
+            return
+        self._cancel = False
+
+        default_name = f"{self.track_name}_ddsp_vst_lead.wav" if self.track_name else "ddsp_vst_lead.wav"
+        default_dir = str(Path(__file__).parent / f"remix_{self.track_name}") if self.track_name else str(Path(__file__).parent)
+        outpath, _ = QFileDialog.getSaveFileName(
+            self,
+            "DDSP VST 楽器化出力先",
+            str(Path(default_dir) / default_name),
+            "WAV (*.wav);;All Files (*)",
+        )
+        self._restore_focus()
+        if not outpath:
+            return
+        outpath = self._normalize_output_path(outpath, "wav")
+
+        self._set_status("DDSP VST 楽器化を準備中...")
+        self._set_action_buttons_enabled(False)
+        vocals = self.stems_raw["vocals"]
+        source_sr = self.sr
+        project_dir = Path(__file__).parent.resolve()
+        setup_script = project_dir / "ddsp_setup.py"
+        transfer_script = project_dir / "ddsp_flute_transfer.py"
+        venv_python = self.ddsp_venv_dir / "bin" / "python"
+        model_dir = self.ddsp_models_dir / "solo_flute_ckpt"
+
+        def task(signals: TaskSignals):
+            def run_checked(cmd: list[str], step_name: str) -> None:
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+                    tail = "\n".join(combined.splitlines()[-40:])
+                    raise RuntimeError(f"{step_name} に失敗しました。\n{tail.strip()}")
+
+            with tempfile.TemporaryDirectory(prefix="ddsp_gui_") as tmp_dir:
+                tmp_dir_path = Path(tmp_dir)
+                input_wav = tmp_dir_path / "vocals.wav"
+                sf.write(str(input_wav), vocals, source_sr, subtype="PCM_24")
+
+                signals.status.emit("DDSP環境をセットアップ中...")
+                signals.progress.emit(10)
+                run_checked(
+                    [
+                        sys.executable,
+                        str(setup_script),
+                        "--venv",
+                        str(self.ddsp_venv_dir),
+                        "--models-dir",
+                        str(self.ddsp_models_dir),
+                        "--model",
+                        "Flute",
+                    ],
+                    "DDSPセットアップ",
+                )
+
+                if not venv_python.exists():
+                    raise RuntimeError(f"DDSP用Pythonが見つかりません: {venv_python}")
+
+                signals.status.emit("DDSP VST 楽器推論中...")
+                signals.progress.emit(40)
+                run_checked(
+                    [
+                        str(venv_python),
+                        str(transfer_script),
+                        "--input",
+                        str(input_wav),
+                        "--output",
+                        str(outpath),
+                        "--model-dir",
+                        str(model_dir),
+                        "--backend",
+                        "auto",
+                        "--vst-model",
+                        "Flute",
+                        "--threshold",
+                        "0.7",
+                        "--quiet",
+                        "36",
+                        "--autotune",
+                        "0.0",
+                        "--pitch-shift",
+                        "0.0",
+                        "--loudness-shift",
+                        "2.5",
+                        "--noise-mix",
+                        "0.02",
+                        "--reverb-mix",
+                        "0.0",
+                        "--post-lowpass",
+                        "4000",
+                        "--post-highpass",
+                        "90",
+                        "--output-drive",
+                        "1.0",
+                        "--pitch-anchor-mix",
+                        "0.18",
+                        "--chunk-seconds",
+                        "12",
+                        "--chunk-overlap-seconds",
+                        "0.6",
+                    ],
+                    "DDSP VST 楽器推論",
+                )
+
+                signals.status.emit("DDSP出力をセッションへ反映中...")
+                signals.progress.emit(85)
+                converted, converted_sr = sf.read(outpath, dtype="float64")
+                if converted.ndim == 2:
+                    converted = np.mean(converted, axis=1)
+                if converted_sr != source_sr:
+                    converted = librosa.resample(converted.astype(np.float32), orig_sr=converted_sr, target_sr=source_sr)
+                if vocals.ndim == 2:
+                    converted = np.column_stack([converted, converted])
+
+                target_len = vocals.shape[0]
+                if len(converted) > target_len:
+                    converted = converted[:target_len]
+                elif len(converted) < target_len:
+                    pad_shape = (target_len - len(converted), vocals.shape[1]) if vocals.ndim == 2 else (target_len - len(converted),)
+                    converted = np.concatenate([converted, np.zeros(pad_shape, dtype=converted.dtype)], axis=0)
+
+                return np.asarray(converted, dtype=np.float64), outpath
+
+        def on_result(result) -> None:
+            if result is None:
+                return
+            converted, path = result
+            self.stems_raw["vocals"] = converted
+            self._update_progress(100)
+            self._set_status(f"DDSP VST 楽器化完了: VOCALSを置換しました ({path})")
+            QMessageBox.information(
+                self,
+                "完了",
+                f"DDSP VST 楽器化が完了しました。\nVOCALSステムを置換し、WAVも保存しました。\n{path}",
+            )
+
+        self._run_task(task, on_result=on_result, on_finished=lambda: self._set_action_buttons_enabled(True))
+
     def _refresh_preset_combo(self) -> None:
         """presetsフォルダをスキャンしてプルダウンを更新"""
         self.preset_combo.blockSignals(True)
@@ -1042,6 +1221,96 @@ class RemixGUI(QMainWindow):
         self.master_sliders["m_reverb_wet"].set_value(25)
         self.master_sliders["m_limiter_db"].set_value(-0.1)
         self._set_status("V2プリセット読み込み完了")
+
+    def _load_instrument_preset(self) -> None:
+        presets = {
+            "drums": dict(
+                volume=1.0,
+                dist_db=0,
+                bitcrush=0,
+                clipping_db=0,
+                ladder_hz=0,
+                lowpass_hz=18000,
+                delay_ms=100,
+                delay_fb=10,
+                delay_mix=0,
+                reverb_room=0.0,
+                reverb_wet=0,
+                comp_thresh=-18,
+                comp_ratio=4.0,
+                comp_attack=5,
+                comp_release=50,
+                gain_db=0,
+            ),
+            "bass": dict(
+                volume=1.0,
+                dist_db=2,
+                bitcrush=0,
+                clipping_db=0,
+                ladder_hz=0,
+                lowpass_hz=3500,
+                delay_ms=100,
+                delay_fb=10,
+                delay_mix=0,
+                reverb_room=0.0,
+                reverb_wet=0,
+                comp_thresh=-20,
+                comp_ratio=4.0,
+                comp_attack=5,
+                comp_release=50,
+                gain_db=1,
+            ),
+            "vocals": dict(
+                volume=1.0,
+                formant=-4.0,
+                instrumentize=82,
+                breath_reduce=88,
+                tone_darken=55,
+                consonant_suppress=82,
+                modulation_blur=68,
+                grit_drive=78,
+                robot_mod=52,
+                dist_db=0,
+                bitcrush=10,
+                clipping_db=0,
+                ladder_hz=0,
+                lowpass_hz=3000,
+                delay_ms=90,
+                delay_fb=8,
+                delay_mix=0,
+                reverb_room=0.15,
+                reverb_wet=5,
+                comp_thresh=-22,
+                comp_ratio=5.0,
+                comp_attack=3,
+                comp_release=45,
+                gain_db=1,
+            ),
+            "other": dict(
+                volume=1.0,
+                dist_db=0,
+                bitcrush=0,
+                clipping_db=0,
+                ladder_hz=0,
+                lowpass_hz=18000,
+                delay_ms=100,
+                delay_fb=10,
+                delay_mix=0,
+                reverb_room=0.0,
+                reverb_wet=0,
+                comp_thresh=-18,
+                comp_ratio=4.0,
+                comp_attack=5,
+                comp_release=50,
+                gain_db=0,
+            ),
+        }
+        for name, params in presets.items():
+            self.stem_controls[name].set_params(params)
+        self.master_sliders["m_reverb_room"].set_value(0.2)
+        self.master_sliders["m_reverb_wet"].set_value(8)
+        self.master_sliders["m_limiter_db"].set_value(-0.3)
+        self._set_status("歌メロ楽器化プリセット読み込み完了")
 
     def _reset_all(self) -> None:
         for name in self.STEM_NAMES:
