@@ -42,7 +42,8 @@ import librosa
 import soundfile as sf
 import pyworld as pw
 from pedalboard import Pedalboard, Reverb
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.signal import butter, sosfiltfilt
 
 from audio_quantize import quantize_stem as _shared_quantize_stem
 
@@ -125,6 +126,137 @@ def shift_formant(audio: np.ndarray, sr: int, shift_semitones: float = 2.0) -> n
         return _process_mono(audio)
 
 
+def bridge_short_unvoiced_gaps(
+    f0_hz: np.ndarray,
+    max_gap_frames: int,
+    max_jump_semitones: float = 7.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """短い無声音ギャップを補間し、母音のつながりだけを保つ。"""
+    bridged = np.asarray(f0_hz, dtype=np.float64).copy()
+    bridge_mask = np.zeros_like(bridged, dtype=bool)
+    voiced = bridged > 0.0
+    n_frames = len(bridged)
+
+    index = 0
+    while index < n_frames:
+        if voiced[index]:
+            index += 1
+            continue
+
+        start = index
+        while index < n_frames and not voiced[index]:
+            index += 1
+        end = index
+        gap = end - start
+
+        if start == 0 or end >= n_frames or gap <= 0 or gap > max_gap_frames:
+            continue
+
+        left = bridged[start - 1]
+        right = bridged[end]
+        if left <= 0.0 or right <= 0.0:
+            continue
+
+        jump_semitones = abs(12.0 * np.log2(max(right, 1e-6) / max(left, 1e-6)))
+        if jump_semitones <= max_jump_semitones:
+            bridged[start:end] = np.linspace(left, right, gap + 2, dtype=np.float64)[1:-1]
+        else:
+            bridged[start:end] = np.sqrt(left * right)
+        bridge_mask[start:end] = True
+
+    return bridged, bridge_mask
+
+
+def cleanup_instrumentized_low_end(audio: np.ndarray, sr: int, amount: float) -> np.ndarray:
+    """WORLD再合成で出やすい低域のうなり/DCを軽く掃除する。"""
+    mono = np.asarray(audio, dtype=np.float64)
+    cutoff_hz = float(np.clip(38.0 + (26.0 * amount), 35.0, 72.0))
+    sos = butter(2, cutoff_hz, btype="highpass", fs=sr, output="sos")
+    filtered = sosfiltfilt(sos, mono).astype(np.float64)
+    return filtered
+
+
+def bandlimit_melody_core(audio: np.ndarray, sr: int) -> np.ndarray:
+    """元ボーカルから、子音を拾いにくいメロディ芯だけを抜き出す。"""
+    mono = np.asarray(audio, dtype=np.float64)
+    low_sos = butter(3, 2400.0, btype="lowpass", fs=sr, output="sos")
+    high_sos = butter(2, 110.0, btype="highpass", fs=sr, output="sos")
+    shaped = sosfiltfilt(low_sos, mono)
+    shaped = sosfiltfilt(high_sos, shaped)
+    return shaped.astype(np.float64)
+
+
+def soft_hpss(
+    spectrum: np.ndarray,
+    harmonic_kernel: int = 31,
+    percussive_kernel: int = 31,
+    harmonic_margin: float = 1.0,
+    percussive_margin: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Median filtering based HPSS without sklearn dependency."""
+    magnitude = np.abs(spectrum).astype(np.float64)
+    power = magnitude ** 2.0
+
+    harmonic_med = median_filter(power, size=(1, harmonic_kernel), mode="nearest")
+    percussive_med = median_filter(power, size=(percussive_kernel, 1), mode="nearest")
+
+    harmonic_score = harmonic_med / np.maximum(harmonic_med + (percussive_margin * percussive_med), 1e-12)
+    percussive_score = percussive_med / np.maximum((harmonic_margin * harmonic_med) + percussive_med, 1e-12)
+
+    total = np.maximum(harmonic_score + percussive_score, 1e-12)
+    harmonic_mask = harmonic_score / total
+    percussive_mask = percussive_score / total
+    return harmonic_mask.astype(np.float64), percussive_mask.astype(np.float64)
+
+
+def frame_activity_from_audio(audio: np.ndarray, sr: int, frame_times: np.ndarray) -> np.ndarray:
+    """元音声の短時間RMSから歌唱アクティビティを推定する。"""
+    mono = np.asarray(audio, dtype=np.float64)
+    if len(mono) == 0 or len(frame_times) == 0:
+        return np.zeros(len(frame_times), dtype=np.float64)
+
+    half_window = max(64, int(round(sr * 0.016)))
+    rms = np.zeros(len(frame_times), dtype=np.float64)
+    for idx, frame_time in enumerate(frame_times):
+        center = int(round(float(frame_time) * sr))
+        start = max(0, center - half_window)
+        end = min(len(mono), center + half_window)
+        if end <= start:
+            continue
+        segment = mono[start:end]
+        rms[idx] = np.sqrt(np.mean(np.square(segment), dtype=np.float64) + 1e-10)
+
+    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-8))
+    floor = float(np.percentile(rms_db, 20))
+    peak = float(np.percentile(rms_db, 98))
+    norm = np.clip((rms_db - floor) / max(peak - floor, 1e-3), 0.0, 1.0)
+    return gaussian_filter1d(norm, sigma=0.8, mode="nearest")
+
+
+def frame_envelope_to_samples(frame_values: np.ndarray, frame_times: np.ndarray, n_samples: int, sr: int) -> np.ndarray:
+    frame_values = np.asarray(frame_values, dtype=np.float64)
+    frame_times = np.asarray(frame_times, dtype=np.float64)
+    if n_samples <= 0:
+        return np.zeros(0, dtype=np.float64)
+    if len(frame_values) == 0:
+        return np.zeros(n_samples, dtype=np.float64)
+    if len(frame_values) == 1:
+        return np.full(n_samples, float(frame_values[0]), dtype=np.float64)
+
+    sample_points = np.clip(np.round(frame_times * sr).astype(np.int64), 0, max(n_samples - 1, 0))
+    sample_points = np.maximum.accumulate(sample_points)
+    unique_points, unique_indices = np.unique(sample_points, return_index=True)
+    unique_values = frame_values[unique_indices]
+    if unique_points[0] != 0:
+        unique_points = np.insert(unique_points, 0, 0)
+        unique_values = np.insert(unique_values, 0, unique_values[0])
+    if unique_points[-1] != n_samples - 1:
+        unique_points = np.append(unique_points, n_samples - 1)
+        unique_values = np.append(unique_values, unique_values[-1])
+
+    return np.interp(np.arange(n_samples, dtype=np.float64), unique_points, unique_values).astype(np.float64)
+
+
 def instrumentize_vocal(
     audio: np.ndarray,
     sr: int,
@@ -169,7 +301,6 @@ def instrumentize_vocal(
         shaped = mono.astype(np.float64)
 
         if robot_mod > 0.0:
-            # ゆるいリング変調で人声らしい倍音関係を崩す。
             carrier_hz = 28.0 + (172.0 * robot_mod)
             t_axis = np.arange(len(shaped), dtype=np.float64) / float(sr)
             carrier = np.sin(2.0 * np.pi * carrier_hz * t_axis)
@@ -178,7 +309,6 @@ def instrumentize_vocal(
             shaped = ((1.0 - mix) * shaped) + (mix * ring)
 
         if grit_drive > 0.0:
-            # wavefold + sample-and-hold で、声の口周りのニュアンスをさらに壊す。
             drive = 1.0 + (22.0 * grit_drive)
             folded = np.sin(shaped * drive)
             clipped = np.tanh(folded * (1.4 + (7.0 * grit_drive)))
@@ -196,72 +326,116 @@ def instrumentize_vocal(
             shaped = shaped / max(1.0, peak / 0.92)
         return shaped
 
+    def _normalize_curve(values: np.ndarray, floor_pct: float, ceil_pct: float) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        low = float(np.percentile(values, floor_pct))
+        high = float(np.percentile(values, ceil_pct))
+        return np.clip((values - low) / max(high - low, 1e-6), 0.0, 1.0)
+
     def _process_mono(mono: np.ndarray) -> np.ndarray:
         mono = mono.astype(np.float64)
-        f0, t = pw.harvest(mono, sr)
-        f0 = pw.stonemask(mono, f0, t, sr)
-        sp = pw.cheaptrick(mono, f0, t, sr)
-        ap = pw.d4c(mono, f0, t, sr)
+        n_fft = 4096 if sr >= 32000 else 2048
+        hop_length = n_fft // 8
 
-        # 細かなフォルマント変化を丸めて、歌詞の明瞭さを少し落とす。
-        log_sp = np.log(np.maximum(sp, 1e-8))
-        sigma = 1.0 + (amount * 7.0)
-        smoothed_sp = np.exp(gaussian_filter1d(log_sp, sigma=sigma, axis=1, mode="nearest"))
-        detail_keep = 1.0 - (0.88 * amount)
-        shaped_sp = (detail_keep * sp) + ((1.0 - detail_keep) * smoothed_sp)
+        spectrum = librosa.stft(mono.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=n_fft)
+        harmonic_mask, percussive_mask = soft_hpss(
+            spectrum,
+            harmonic_kernel=31,
+            percussive_kernel=31,
+            harmonic_margin=1.0 + (2.4 * amount),
+            percussive_margin=1.0 + (6.0 * max(breath_reduction, consonant_suppress)),
+        )
+        harmonic = spectrum * harmonic_mask
+        percussive = spectrum * percussive_mask
 
-        # 高域だけ時間方向にぼかして、音節/子音の動きの手掛かりを減らす。
-        if modulation_blur > 0.0:
-            blur_sigma_frames = 0.5 + (5.5 * amount * modulation_blur)
-            time_smoothed = np.exp(
-                gaussian_filter1d(
-                    np.log(np.maximum(shaped_sp, 1e-8)),
-                    sigma=blur_sigma_frames,
-                    axis=0,
-                    mode="nearest",
-                )
-            )
-            freq_hz = np.linspace(0.0, sr / 2.0, shaped_sp.shape[1], dtype=np.float64)
-            highband_weight = np.clip((freq_hz - 1400.0) / 2600.0, 0.0, 1.0)
-            blur_mix = amount * modulation_blur * highband_weight[np.newaxis, :]
-            shaped_sp = (shaped_sp * (1.0 - blur_mix)) + (time_smoothed * blur_mix)
+        magnitude = np.abs(spectrum) + 1e-8
+        harmonic_mag = np.abs(harmonic)
+        percussive_mag = np.abs(percussive)
+        residual_mag = np.maximum(magnitude - harmonic_mag - percussive_mag, 0.0)
 
-        # 高域を少し暗くして、声の子音・歯擦音が前に出すぎるのを抑える。
+        frame_rms = np.sqrt(np.mean(np.square(magnitude), axis=0) + 1e-10)
+        frame_flatness = librosa.feature.spectral_flatness(S=magnitude)[0]
+        onset_env = librosa.onset.onset_strength(S=librosa.amplitude_to_db(magnitude, ref=np.max), sr=sr, hop_length=hop_length)
+        onset_env = np.pad(onset_env, (0, max(0, magnitude.shape[1] - len(onset_env))), mode="edge")[: magnitude.shape[1]]
+
+        harmonic_ratio = np.sum(harmonic_mag, axis=0) / np.maximum(np.sum(magnitude, axis=0), 1e-8)
+        percussive_ratio = np.sum(percussive_mag, axis=0) / np.maximum(np.sum(magnitude, axis=0), 1e-8)
+        residual_ratio = np.sum(residual_mag, axis=0) / np.maximum(np.sum(magnitude, axis=0), 1e-8)
+
+        activity = gaussian_filter1d(_normalize_curve(frame_rms, 20, 98), sigma=0.8, mode="nearest")
+        flatness_score = gaussian_filter1d(_normalize_curve(frame_flatness, 20, 98), sigma=0.6, mode="nearest")
+        onset_score = gaussian_filter1d(_normalize_curve(onset_env, 30, 98), sigma=0.7, mode="nearest")
+        percussive_score = gaussian_filter1d(_normalize_curve(percussive_ratio + (0.75 * residual_ratio), 20, 98), sigma=0.7, mode="nearest")
+        sustain_score = gaussian_filter1d(np.clip(harmonic_ratio * (0.65 + (0.35 * activity)), 0.0, 1.0), sigma=1.0, mode="nearest")
+
+        frame_articulation = np.clip(
+            (0.55 * percussive_score)
+            + (0.45 * flatness_score)
+            + (0.35 * onset_score)
+            + (0.18 * (1.0 - activity)),
+            0.0,
+            1.0,
+        )
+
+        freq_hz = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        highband = np.clip((freq_hz - 1600.0) / 3200.0, 0.0, 1.0)
+        airband = np.clip((freq_hz - 4200.0) / 2600.0, 0.0, 1.0)
+        lowband = np.clip((220.0 - freq_hz) / 220.0, 0.0, 1.0)
+
+        harmonic_gain = 1.0 + (0.05 * amount * (1.0 - highband))
+        residual_gain = 1.0 - (
+            (0.70 * amount * breath_reduction * highband[:, np.newaxis])
+            + (0.62 * amount * consonant_suppress * frame_articulation[np.newaxis, :] * highband[:, np.newaxis])
+            + (0.26 * amount * modulation_blur * onset_score[np.newaxis, :] * highband[:, np.newaxis])
+        )
+        residual_gain = np.clip(residual_gain, 0.04, 1.0)
+
+        percussive_gain = 1.0 - (
+            (0.82 * amount * breath_reduction * (0.30 + (0.70 * highband[:, np.newaxis])))
+            + (0.78 * amount * consonant_suppress * frame_articulation[np.newaxis, :])
+        )
+        percussive_gain = np.clip(percussive_gain, 0.02, 0.85)
+
         if tone_darken > 0.0:
-            freq_hz = np.linspace(0.0, sr / 2.0, shaped_sp.shape[1], dtype=np.float64)
-            ramp = np.clip((freq_hz - 1200.0) / max((sr / 2.0) - 1200.0, 1.0), 0.0, 1.0)
-            tilt_db = -18.0 * amount * tone_darken * ramp
-            shaped_sp *= 10.0 ** (tilt_db[np.newaxis, :] / 20.0)
-
-        # 息・子音に相当する非周期成分を落として、シンセ/リード寄りへ。
-        if breath_reduction > 0.0:
-            freq_ratio = np.linspace(0.0, 1.0, ap.shape[1], dtype=np.float64)
-            reduction_curve = 0.20 + (0.80 * freq_ratio)
-            reduction = 1.0 - (0.95 * amount * breath_reduction * reduction_curve)
-            shaped_ap = np.clip(ap * reduction[np.newaxis, :], 0.0, 1.0)
+            tone_gain = 10.0 ** ((-14.0 * amount * tone_darken * highband)[:, np.newaxis] / 20.0)
         else:
-            shaped_ap = ap
+            tone_gain = 1.0
 
-        # 無声音や高aperiodicityフレームを減衰して、歌詞の聞き取りをさらに落とす。
-        if consonant_suppress > 0.0:
-            voiced_mask = (f0 > 0.0).astype(np.float64)
-            aperiodic_mean = np.mean(shaped_ap, axis=1)
-            consonant_score = np.clip(
-                (1.0 - voiced_mask) * 0.85 + (aperiodic_mean ** 0.8) * 0.9,
-                0.0,
-                1.0,
-            )
-            attenuation_db = -34.0 * amount * consonant_suppress * consonant_score
-            frame_gain = 10.0 ** (attenuation_db / 20.0)
-            shaped_sp *= frame_gain[:, np.newaxis]
-            shaped_ap *= (0.30 + 0.70 * frame_gain[:, np.newaxis])
+        # 低域のうなりは percussive / residual 側だけ積極的に抑える。
+        low_cleanup = 1.0 - (0.88 * lowband[:, np.newaxis] * (0.45 + (0.55 * frame_articulation[np.newaxis, :])))
+        low_cleanup = np.clip(low_cleanup, 0.12, 1.0)
 
-        out = pw.synthesize(f0, shaped_sp, shaped_ap, sr)
-        if len(out) > len(mono):
-            out = out[:len(mono)]
-        elif len(out) < len(mono):
-            out = np.pad(out, (0, len(mono) - len(out)))
+        out_spec = (
+            (harmonic * harmonic_gain[:, np.newaxis])
+            + (percussive * percussive_gain * tone_gain * low_cleanup)
+            + ((spectrum - harmonic - percussive) * residual_gain * tone_gain * low_cleanup)
+        )
 
+        # sustain 区間だけ、元ボーカルのメロディ芯を薄く残す。
+        melody_core = bandlimit_melody_core(mono, sr)
+        frame_keep = np.clip((0.78 * sustain_score) + (0.24 * activity) - (0.14 * frame_articulation), 0.0, 1.0)
+        sample_keep = np.interp(
+            np.arange(len(mono), dtype=np.float64),
+            np.linspace(0.0, len(mono) - 1, num=len(frame_keep), dtype=np.float64),
+            frame_keep,
+        )
+
+        out = librosa.istft(out_spec, hop_length=hop_length, win_length=n_fft, length=len(mono)).astype(np.float64)
+        core_mix = (0.10 + (0.12 * amount)) * sample_keep
+        out = ((1.0 - core_mix) * out) + (core_mix * melody_core)
+
+        # 歌っていない区間は residual/percussive を落とすが、母音の持続は残す。
+        silence_gate = np.clip((sample_keep - 0.05) / 0.95, 0.0, 1.0)
+        out *= (0.06 + (0.94 * silence_gate))
+
+        # 仕上げの de-ess / low-end cleanup
+        if tone_darken > 0.0 or breath_reduction > 0.0:
+            high_sos = butter(2, 5200.0, btype="lowpass", fs=sr, output="sos")
+            softened = sosfiltfilt(high_sos, out)
+            mix = 0.12 * amount * max(tone_darken, breath_reduction)
+            out = ((1.0 - mix) * out) + (mix * softened)
+
+        out = cleanup_instrumentized_low_end(out, sr, amount)
         return _apply_robot_grit(out)
 
     if is_stereo:

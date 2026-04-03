@@ -227,6 +227,7 @@ class RemixGUI(QMainWindow):
         self.setMinimumSize(900, 680)
 
         self.stems_raw: dict[str, np.ndarray] = {}
+        self.stems_original: dict[str, np.ndarray] = {}
         self.sr = 44100
         self.playing = False
         self._cancel = False  # 処理中断フラグ
@@ -502,6 +503,7 @@ class RemixGUI(QMainWindow):
             QMessageBox.critical(self, "エラー", f"4ステム中{len(found)}個のみ\n{folder_path}")
             return
         self.stems_raw = found
+        self.stems_original = {name: np.copy(audio) for name, audio in found.items()}
         self.track_name = folder_path.name
         self._set_status(f"読み込み完了: {folder_path.name} ({self.sr}Hz)")
 
@@ -560,6 +562,7 @@ class RemixGUI(QMainWindow):
         def on_result(result) -> None:
             found, sr, track_name, original_path = result
             self.stems_raw = found
+            self.stems_original = {name: np.copy(audio) for name, audio in found.items()}
             self.sr = sr
             self.track_name = track_name
             # 曲名フォルダを作成してステムと元ファイルを保存
@@ -1268,18 +1271,18 @@ class RemixGUI(QMainWindow):
                 tone_darken=55,
                 consonant_suppress=82,
                 modulation_blur=68,
-                grit_drive=78,
-                robot_mod=52,
+                grit_drive=0,
+                robot_mod=0,
                 dist_db=0,
-                bitcrush=10,
+                bitcrush=0,
                 clipping_db=0,
                 ladder_hz=0,
-                lowpass_hz=3000,
+                lowpass_hz=4200,
                 delay_ms=90,
                 delay_fb=8,
                 delay_mix=0,
-                reverb_room=0.15,
-                reverb_wet=5,
+                reverb_room=0.08,
+                reverb_wet=2,
                 comp_thresh=-22,
                 comp_ratio=5.0,
                 comp_attack=3,
