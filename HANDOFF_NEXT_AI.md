@@ -1,6 +1,6 @@
 # 次AI向け引き継ぎ書
 
-最終更新: 2026-04-04
+最終更新: 2026-04-04 (v2マージ完了)
 
 ---
 
@@ -19,6 +19,12 @@
 - 現在は `STFT + HPSS + 高域抑制 + 原音再注入` ベース
 - `DDSP VST 楽器化` は音色は良いが、メロディ保持で不満が残り、現在は主戦場でない
 
+### v2 高音保護改善（マージ完了: 2026-04-04）
+
+セクション3の6変更を `music_remix.py` 本体にマージ済み。合成信号テスト結果:
+- src  seg_high4k=0.5572, seg_cent=7843.5
+- v2   seg_high4k=0.5158, seg_cent=7302.1 (高域保持しつつ発音感を低減)
+
 ### 今回のセッションで判明した重大バグ（修正済み）
 
 `instrumentize_vocal()` の `out_spec` 計算に **OOM クラッシュバグ** があった。
@@ -36,10 +42,9 @@
 これにより、以前は `instrumentize_vocal()` を実行するたびに裏でメモリを大量消費していた。
 
 
-## 3. 今回実装した高音保護改善 (v2) — Colab で検証済み
+## 3. 高音保護改善 (v2) — マージ完了
 
-以下の 6 点を `instrumentize_vocal_v2` として Colab テスト済み。  
-**ただし、まだ `music_remix.py` 本体には未マージ（次AIへの課題）。**
+以下の 6 点を `music_remix.py` 本体にマージ済み (コミット: 次コミット参照)。
 
 | # | 変更内容 | 旧値 | 新値 |
 |---|---|---|---|
@@ -123,10 +128,9 @@ lowpass_hz=6500, reverb_room=0.02, reverb_wet=0
 
 ## 6. 次にやるべきこと（優先順）
 
-1. **v2 の変更を `music_remix.py` 本体にマージする**  
-   Colab の `instrumentize_vocal_v2` と同じ内容をローカルに反映
+1. ~~**v2 の変更を `music_remix.py` 本体にマージする**~~ ✅ 完了
 
-2. `/tmp/ddsp_backnumber_45_53.wav` の `4.19s–5.63s` 区間で再検証  
+2. 実音源 `/tmp/ddsp_backnumber_45_53.wav` の `4.19s–5.63s` 区間で聴感検証  
    数値指標: `4kHz 以上の比率`, `spectral centroid`, `seg_rms`
 
 3. さらに高音潰れが残る場合:
@@ -147,8 +151,8 @@ lowpass_hz=6500, reverb_room=0.02, reverb_wet=0
 
 - リポジトリ: `/Users/gon/Documents/AI_Generated_Apps/music-remix-app`
 - ブランチ: `main`
-- 最新コミット: `94e5180` `Fix OOM bug in instrumentize_vocal and improve high-note preservation`
-- 未追跡ファイル: `HANDOFF_NEXT_AI.md`, `NEXT_AI_PROMPT.md`, `HYBRID_VOCAL_APP_SPEC.md`, `colab_restart_setup.sh`
+- 最新コミット: v2マージコミット (2026-04-04)
+- 主な変更ファイル: `music_remix.py`, `HANDOFF_NEXT_AI.md`, `NEXT_AI_PROMPT.md`
 
 
 ## 9. 検証コマンド（参考）

@@ -189,7 +189,7 @@ def bandlimit_melody_core(audio: np.ndarray, sr: int) -> np.ndarray:
 def bandlimit_high_melody_core(audio: np.ndarray, sr: int) -> np.ndarray:
     """高音域の輪郭を守るため、少し広めの帯域で元ボーカル芯を抜き出す。"""
     mono = np.asarray(audio, dtype=np.float64)
-    low_sos = butter(3, 4200.0, btype="lowpass", fs=sr, output="sos")
+    low_sos = butter(3, 5500.0, btype="lowpass", fs=sr, output="sos")
     high_sos = butter(2, 160.0, btype="highpass", fs=sr, output="sos")
     shaped = sosfiltfilt(low_sos, mono)
     shaped = sosfiltfilt(high_sos, shaped)
@@ -408,7 +408,7 @@ def instrumentize_vocal(
             0.0,
             1.0,
         )
-        high_pitch_score = gaussian_filter1d(np.clip((f0_track - 205.0) / 60.0, 0.0, 1.0), sigma=1.0, mode="nearest")
+        high_pitch_score = gaussian_filter1d(np.clip((f0_track - 180.0) / 40.0, 0.0, 1.0), sigma=1.0, mode="nearest")
         high_pitch_seed = np.clip((f0_track - 185.0) / 85.0, 0.0, 1.0)
         high_pitch_seed = np.maximum(high_pitch_seed, 0.55 * bridge_mask.astype(np.float64))
         high_pitch_focus = np.clip(high_pitch_score * np.clip(0.52 + (0.48 * sustain_score), 0.0, 1.0), 0.0, 1.0)
@@ -418,7 +418,16 @@ def instrumentize_vocal(
             mode="nearest",
         )
         high_pitch_guard = np.clip(np.maximum(high_pitch_guard, high_pitch_focus), 0.0, 1.0)
-        high_pitch_relief = 1.0 - (0.96 * high_pitch_guard[np.newaxis, :])
+        # スペクトル重心フォールバック: pyin が f0=0 を返す高音フレームも保護
+        centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sr)[0]
+        unvoiced_mask = (f0_track == 0.0).astype(np.float64)
+        centroid_guard = gaussian_filter1d(
+            np.clip((centroid - 1500.0) / 1500.0, 0.0, 1.0) * unvoiced_mask * 0.6,
+            sigma=1.2,
+            mode="nearest",
+        )
+        high_pitch_guard = np.clip(np.maximum(high_pitch_guard, centroid_guard), 0.0, 1.0)
+        high_pitch_relief = 1.0 - (0.98 * high_pitch_guard[np.newaxis, :])
 
         freq_hz = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
         highband = np.clip((freq_hz - 1600.0) / 3200.0, 0.0, 1.0)
@@ -442,11 +451,11 @@ def instrumentize_vocal(
         highband_matrix = highband[:, np.newaxis]
         protected_highband = highband_matrix * (1.0 - (0.88 * harmonic_protect))
         suppression_highband = protected_highband * (1.0 - (0.74 * high_pitch_guard[np.newaxis, :]))
-        dynamic_amount = amount * (1.0 - (0.78 * high_pitch_guard[np.newaxis, :]))
-        dynamic_breath = breath_reduction * (1.0 - (0.84 * high_pitch_guard[np.newaxis, :]))
-        dynamic_consonant = consonant_suppress * (1.0 - (0.82 * high_pitch_guard[np.newaxis, :]))
-        dynamic_blur = modulation_blur * (1.0 - (0.88 * high_pitch_guard[np.newaxis, :]))
-        dynamic_tone = tone_darken * (1.0 - (0.94 * high_pitch_guard[np.newaxis, :]))
+        dynamic_amount = amount * (1.0 - (0.85 * high_pitch_guard[np.newaxis, :]))
+        dynamic_breath = breath_reduction * (1.0 - (0.90 * high_pitch_guard[np.newaxis, :]))
+        dynamic_consonant = consonant_suppress * (1.0 - (0.88 * high_pitch_guard[np.newaxis, :]))
+        dynamic_blur = modulation_blur * (1.0 - (0.92 * high_pitch_guard[np.newaxis, :]))
+        dynamic_tone = tone_darken * (1.0 - (0.97 * high_pitch_guard[np.newaxis, :]))
 
         harmonic_gain = 1.0 + (0.05 * dynamic_amount * (1.0 - highband[:, np.newaxis]))
         residual_gain = 1.0 - (
@@ -500,7 +509,7 @@ def instrumentize_vocal(
         out = ((1.0 - high_core_mix) * out) + (high_core_mix * high_core)
 
         # 高音ではほぼ dry 側に寄せて、メロディ輪郭を優先して残す。
-        conservative_mix = np.clip((0.50 + (0.32 * amount)) * sample_keep * high_pitch_keep, 0.0, 0.88)
+        conservative_mix = np.clip((0.62 + (0.28 * amount)) * sample_keep * high_pitch_keep, 0.0, 0.96)
         out = ((1.0 - conservative_mix) * out) + (conservative_mix * mono)
 
         # 歌っていない区間は residual/percussive を落とすが、母音の持続は残す。
