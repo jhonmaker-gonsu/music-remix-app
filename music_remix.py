@@ -186,6 +186,16 @@ def bandlimit_melody_core(audio: np.ndarray, sr: int) -> np.ndarray:
     return shaped.astype(np.float64)
 
 
+def bandlimit_high_melody_core(audio: np.ndarray, sr: int) -> np.ndarray:
+    """高音域の輪郭を守るため、少し広めの帯域で元ボーカル芯を抜き出す。"""
+    mono = np.asarray(audio, dtype=np.float64)
+    low_sos = butter(3, 4200.0, btype="lowpass", fs=sr, output="sos")
+    high_sos = butter(2, 160.0, btype="highpass", fs=sr, output="sos")
+    shaped = sosfiltfilt(low_sos, mono)
+    shaped = sosfiltfilt(high_sos, shaped)
+    return shaped.astype(np.float64)
+
+
 def soft_hpss(
     spectrum: np.ndarray,
     harmonic_kernel: int = 31,
@@ -361,6 +371,28 @@ def instrumentize_vocal(
         harmonic_ratio = np.sum(harmonic_mag, axis=0) / np.maximum(np.sum(magnitude, axis=0), 1e-8)
         percussive_ratio = np.sum(percussive_mag, axis=0) / np.maximum(np.sum(magnitude, axis=0), 1e-8)
         residual_ratio = np.sum(residual_mag, axis=0) / np.maximum(np.sum(magnitude, axis=0), 1e-8)
+        f0_hz, _, _ = librosa.pyin(
+            mono.astype(np.float32),
+            sr=sr,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7"),
+            frame_length=n_fft,
+            hop_length=hop_length,
+        )
+        if f0_hz is None:
+            f0_hz = np.zeros(magnitude.shape[1], dtype=np.float64)
+        else:
+            f0_hz = np.nan_to_num(f0_hz, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+        if len(f0_hz) < magnitude.shape[1]:
+            f0_hz = np.pad(f0_hz, (0, magnitude.shape[1] - len(f0_hz)))
+        elif len(f0_hz) > magnitude.shape[1]:
+            f0_hz = f0_hz[: magnitude.shape[1]]
+        gap_frames = max(3, int(round((0.075 * sr) / hop_length)))
+        f0_track, bridge_mask = bridge_short_unvoiced_gaps(
+            f0_hz,
+            max_gap_frames=gap_frames,
+            max_jump_semitones=6.5,
+        )
 
         activity = gaussian_filter1d(_normalize_curve(frame_rms, 20, 98), sigma=0.8, mode="nearest")
         flatness_score = gaussian_filter1d(_normalize_curve(frame_flatness, 20, 98), sigma=0.6, mode="nearest")
@@ -376,28 +408,62 @@ def instrumentize_vocal(
             0.0,
             1.0,
         )
+        high_pitch_score = gaussian_filter1d(np.clip((f0_track - 205.0) / 60.0, 0.0, 1.0), sigma=1.0, mode="nearest")
+        high_pitch_seed = np.clip((f0_track - 185.0) / 85.0, 0.0, 1.0)
+        high_pitch_seed = np.maximum(high_pitch_seed, 0.55 * bridge_mask.astype(np.float64))
+        high_pitch_focus = np.clip(high_pitch_score * np.clip(0.52 + (0.48 * sustain_score), 0.0, 1.0), 0.0, 1.0)
+        high_pitch_guard = gaussian_filter1d(
+            np.maximum(high_pitch_focus, high_pitch_seed * np.clip(0.48 + (0.52 * activity), 0.0, 1.0)),
+            sigma=1.8,
+            mode="nearest",
+        )
+        high_pitch_guard = np.clip(np.maximum(high_pitch_guard, high_pitch_focus), 0.0, 1.0)
+        high_pitch_relief = 1.0 - (0.96 * high_pitch_guard[np.newaxis, :])
 
         freq_hz = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
         highband = np.clip((freq_hz - 1600.0) / 3200.0, 0.0, 1.0)
-        airband = np.clip((freq_hz - 4200.0) / 2600.0, 0.0, 1.0)
         lowband = np.clip((220.0 - freq_hz) / 220.0, 0.0, 1.0)
+        harmonic_protect = np.zeros((len(freq_hz), magnitude.shape[1]), dtype=np.float64)
+        voiced_frames = f0_track > 0.0
+        if np.any(voiced_frames):
+            for harmonic_index in range(1, 10):
+                harmonic_hz = f0_track * harmonic_index
+                valid = voiced_frames & (harmonic_hz < (sr * 0.47))
+                if not np.any(valid):
+                    continue
+                width_hz = np.maximum(90.0, (0.16 * harmonic_hz) + 24.0)
+                dist_hz = np.abs(freq_hz[:, np.newaxis] - harmonic_hz[np.newaxis, :])
+                protect = np.exp(-0.5 * np.square(dist_hz / np.maximum(width_hz[np.newaxis, :], 1.0)))
+                protect *= valid[np.newaxis, :]
+                protect *= (1.0 / (harmonic_index ** 0.55))
+                harmonic_protect = np.maximum(harmonic_protect, protect)
+        harmonic_protect *= (0.45 + (0.55 * high_pitch_guard[np.newaxis, :]))
+        harmonic_protect = np.clip(harmonic_protect, 0.0, 1.0)
+        highband_matrix = highband[:, np.newaxis]
+        protected_highband = highband_matrix * (1.0 - (0.88 * harmonic_protect))
+        suppression_highband = protected_highband * (1.0 - (0.74 * high_pitch_guard[np.newaxis, :]))
+        dynamic_amount = amount * (1.0 - (0.78 * high_pitch_guard[np.newaxis, :]))
+        dynamic_breath = breath_reduction * (1.0 - (0.84 * high_pitch_guard[np.newaxis, :]))
+        dynamic_consonant = consonant_suppress * (1.0 - (0.82 * high_pitch_guard[np.newaxis, :]))
+        dynamic_blur = modulation_blur * (1.0 - (0.88 * high_pitch_guard[np.newaxis, :]))
+        dynamic_tone = tone_darken * (1.0 - (0.94 * high_pitch_guard[np.newaxis, :]))
 
-        harmonic_gain = 1.0 + (0.05 * amount * (1.0 - highband))
+        harmonic_gain = 1.0 + (0.05 * dynamic_amount * (1.0 - highband[:, np.newaxis]))
         residual_gain = 1.0 - (
-            (0.70 * amount * breath_reduction * highband[:, np.newaxis])
-            + (0.62 * amount * consonant_suppress * frame_articulation[np.newaxis, :] * highband[:, np.newaxis])
-            + (0.26 * amount * modulation_blur * onset_score[np.newaxis, :] * highband[:, np.newaxis])
+            (0.70 * dynamic_amount * dynamic_breath * suppression_highband * high_pitch_relief)
+            + (0.62 * dynamic_amount * dynamic_consonant * frame_articulation[np.newaxis, :] * suppression_highband * high_pitch_relief)
+            + (0.26 * dynamic_amount * dynamic_blur * onset_score[np.newaxis, :] * suppression_highband)
         )
         residual_gain = np.clip(residual_gain, 0.04, 1.0)
 
         percussive_gain = 1.0 - (
-            (0.82 * amount * breath_reduction * (0.30 + (0.70 * highband[:, np.newaxis])))
-            + (0.78 * amount * consonant_suppress * frame_articulation[np.newaxis, :])
+            (0.82 * dynamic_amount * dynamic_breath * (0.30 + (0.70 * suppression_highband)) * high_pitch_relief)
+            + (0.78 * dynamic_amount * dynamic_consonant * frame_articulation[np.newaxis, :] * (1.0 - (0.68 * harmonic_protect)) * high_pitch_relief)
         )
         percussive_gain = np.clip(percussive_gain, 0.02, 0.85)
 
         if tone_darken > 0.0:
-            tone_gain = 10.0 ** ((-14.0 * amount * tone_darken * highband)[:, np.newaxis] / 20.0)
+            tone_gain = 10.0 ** ((-14.0 * dynamic_amount * dynamic_tone * suppression_highband) / 20.0)
         else:
             tone_gain = 1.0
 
@@ -406,7 +472,7 @@ def instrumentize_vocal(
         low_cleanup = np.clip(low_cleanup, 0.12, 1.0)
 
         out_spec = (
-            (harmonic * harmonic_gain[:, np.newaxis])
+            (harmonic * harmonic_gain)
             + (percussive * percussive_gain * tone_gain * low_cleanup)
             + ((spectrum - harmonic - percussive) * residual_gain * tone_gain * low_cleanup)
         )
@@ -424,6 +490,19 @@ def instrumentize_vocal(
         core_mix = (0.10 + (0.12 * amount)) * sample_keep
         out = ((1.0 - core_mix) * out) + (core_mix * melody_core)
 
+        high_pitch_keep = np.interp(
+            np.arange(len(mono), dtype=np.float64),
+            np.linspace(0.0, len(mono) - 1, num=len(high_pitch_guard), dtype=np.float64),
+            high_pitch_guard,
+        )
+        high_core = bandlimit_high_melody_core(mono, sr)
+        high_core_mix = (0.22 + (0.18 * amount)) * sample_keep * high_pitch_keep
+        out = ((1.0 - high_core_mix) * out) + (high_core_mix * high_core)
+
+        # 高音ではほぼ dry 側に寄せて、メロディ輪郭を優先して残す。
+        conservative_mix = np.clip((0.50 + (0.32 * amount)) * sample_keep * high_pitch_keep, 0.0, 0.88)
+        out = ((1.0 - conservative_mix) * out) + (conservative_mix * mono)
+
         # 歌っていない区間は residual/percussive を落とすが、母音の持続は残す。
         silence_gate = np.clip((sample_keep - 0.05) / 0.95, 0.0, 1.0)
         out *= (0.06 + (0.94 * silence_gate))
@@ -432,7 +511,7 @@ def instrumentize_vocal(
         if tone_darken > 0.0 or breath_reduction > 0.0:
             high_sos = butter(2, 5200.0, btype="lowpass", fs=sr, output="sos")
             softened = sosfiltfilt(high_sos, out)
-            mix = 0.12 * amount * max(tone_darken, breath_reduction)
+            mix = (0.12 * amount * max(tone_darken, breath_reduction)) * (1.0 - (0.94 * high_pitch_keep))
             out = ((1.0 - mix) * out) + (mix * softened)
 
         out = cleanup_instrumentized_low_end(out, sr, amount)
